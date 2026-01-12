@@ -18,7 +18,6 @@
   "dependencies": {
     "@clack/prompts": "^0.11.0",
     "@iarna/toml": "^2.2.5",
-    "@opentui/core": "^0.1.72",
     "yargs": "^18.0.0"
   }
 }

@@ -1,0 +1,17 @@
+# Stacker Configuration
+# Place this file in your repository root as .stacker.toml
+
+[common]
+verbose = false
+hyperlinks = true
+
+[repo]
+remote = "origin"
+target = "main"
+reviewers = []
+
+[stack]
+# Branch naming template
+# $BRANCH = current feature branch name
+# $ID = stack position number
+branch_template = "$BRANCH/stack/$ID"

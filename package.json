@@ -1,0 +1,24 @@
+{
+  "name": "stacker",
+  "version": "0.1.0",
+  "description": "CLI tool for managing stacked PRs on GitHub",
+  "type": "module",
+  "bin": {
+    "stacker": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/yargs": "^17.0.35",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.11.0",
+    "@iarna/toml": "^2.2.5",
+    "@opentui/core": "^0.1.72",
+    "yargs": "^18.0.0"
+  }
+}

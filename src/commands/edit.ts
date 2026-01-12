@@ -15,7 +15,9 @@ import { exec } from "../utils/exec";
 import { handleError } from "../utils/error-handler";
 import { logger } from "../utils/logger";
 import { RebaseInProgressError } from "../utils/errors";
-import { runEditTUI, generateRebaseTodo, printEditHelp } from "../tui/edit-app";
+import { multiselect, isCancel } from "@clack/prompts";
+import { generateRebaseTodo, printEditHelp } from "../tui/edit-app";
+import type { RebaseAction } from "../types";
 
 export async function editCommand(argv: ArgumentsCamelCase): Promise<void> {
   const opts = argv as unknown as {
@@ -80,31 +82,40 @@ export async function editCommand(argv: ArgumentsCamelCase): Promise<void> {
 
     logger.info(`Found ${stack.entries.length} commits to edit`);
 
-    // Check if we should use TUI or simple text
+    // Check if we should use prompts or simple text
     if (!process.stdout.isTTY) {
       printEditHelp();
       return;
     }
 
-    // Run the edit TUI
-    let actions;
-    try {
-      actions = await runEditTUI(stack);
-    } catch (tuiError) {
-      logger.debug(`TUI failed: ${tuiError}`, verbose);
-      printEditHelp();
-      return;
-    }
+    // Prompt user to select commits to edit
+    const selected = await multiselect({
+      message: "Select commits to edit",
+      options: stack.entries.map((entry) => ({
+        value: entry.commit.sha,
+        label: `${entry.commit.shortSha} ${entry.commit.subject}`,
+      })),
+      required: false,
+    });
 
-    if (!actions) {
+    if (isCancel(selected)) {
       logger.info("Edit cancelled");
       return;
     }
 
+    const selectedShas = new Set(selected as string[]);
+
+    // Build rebase actions: selected commits get 'edit', others get 'pick'
+    const actions: RebaseAction[] = stack.entries.map((entry) => ({
+      type: selectedShas.has(entry.commit.sha) ? "edit" : "pick",
+      sha: entry.commit.sha,
+      subject: entry.commit.subject,
+    }));
+
     // Check if any actions are non-pick
     const hasChanges = actions.some((a) => a.type !== "pick");
     if (!hasChanges) {
-      logger.info("No changes to make");
+      logger.info("No commits selected to edit");
       return;
     }
 

@@ -3,7 +3,7 @@
  */
 
 import type { ArgumentsCamelCase } from "yargs";
-import { stageAll, amendNoEdit, amendWithMessage } from "../core/git";
+import { stageAll, amendNoEdit, amendWithMessage, isRebaseInProgress, continueRebase } from "../core/git";
 import { validatePrerequisites } from "../core/validate";
 import { exec } from "../utils/exec";
 import { handleError } from "../utils/error-handler";
@@ -44,7 +44,16 @@ export async function amendCommand(argv: ArgumentsCamelCase): Promise<void> {
     }
 
     logger.success("Commit amended successfully!");
-    logger.info("Run 'stacker submit' to update the PR");
+
+    // If a rebase is in progress, continue it
+    const rebaseInProgress = await isRebaseInProgress();
+    if (rebaseInProgress) {
+      logger.info("Continuing rebase...");
+      await continueRebase();
+      logger.success("Rebase continued successfully");
+    } else {
+      logger.info("Run 'stacker submit' to update the PR");
+    }
   } catch (error) {
     handleError(error, verbose);
   }

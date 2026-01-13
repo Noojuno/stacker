@@ -20,6 +20,7 @@ export async function viewCommand(argv: ArgumentsCamelCase): Promise<void> {
 
   try {
     // Validate prerequisites
+    logger.info("Validating prerequisites...");
     await validatePrerequisites({
       requireGitRepo: true,
       requireCommits: true,
@@ -28,6 +29,7 @@ export async function viewCommand(argv: ArgumentsCamelCase): Promise<void> {
     });
 
     // Build the stack
+    logger.info("Building stack...");
     const stack = await buildStack({
       base,
       head,
@@ -45,6 +47,9 @@ export async function viewCommand(argv: ArgumentsCamelCase): Promise<void> {
     }
 
     printStackText(stack);
+    
+    // Ensure process exits cleanly
+    process.exit(0);
   } catch (error) {
     handleError(error, verbose);
   }

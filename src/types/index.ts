@@ -15,6 +15,7 @@ export interface Commit {
 export interface StackEntry {
   commit: Commit;
   prNumber?: number;
+  prUrl?: string;
   branchName: string;
   targetBranch: string;
 }

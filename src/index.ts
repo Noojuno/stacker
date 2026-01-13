@@ -68,6 +68,11 @@ const cli = yargs(hideBin(process.argv))
         default: false,
         describe: "Keep existing PR body, only update cross-links",
       },
+      "update-title": {
+        type: "boolean",
+        default: false,
+        describe: "Update PR titles from commit subjects",
+      },
     },
     submitCommand
   )

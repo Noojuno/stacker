@@ -3,7 +3,7 @@
  */
 
 import type { ArgumentsCamelCase } from "yargs";
-import { buildStack, generatePRBody } from "../core/stack";
+import { buildStack, generatePRBody, generateStackBranchName, extractStackName } from "../core/stack";
 import { validatePrerequisites } from "../core/validate";
 import {
   createPR,
@@ -19,11 +19,18 @@ import {
   amendCommitMessage,
   checkout,
   getSha,
+  getCommitsInRange,
+  getMergeBase,
+  parseCommit,
+  deleteLocalBranch,
+  getTreeSha,
+  getRemoteTreeSha,
 } from "../core/git";
-import { setTrailers, TRAILER_KEYS } from "../utils/trailers";
+import { setTrailers, TRAILER_KEYS, getStackerTrailers } from "../utils/trailers";
 import { handleError } from "../utils/error-handler";
 import { logger } from "../utils/logger";
 import { loadConfig } from "../core/config";
+import { execStdout } from "../utils/exec";
 
 export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
   const opts = argv as unknown as {
@@ -35,9 +42,10 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
     draft: boolean;
     reviewer?: string;
     keepBody: boolean;
+    updateTitle: boolean;
   };
 
-  const { remote, base, head, target, verbose, draft, reviewer, keepBody } = opts;
+  const { remote, base, head, target, verbose, draft, reviewer, keepBody, updateTitle } = opts;
 
   try {
     // Validate prerequisites
@@ -70,30 +78,101 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
 
     // Save current branch to return to later
     const originalBranch = await getCurrentBranch();
-    const originalSha = await getSha("HEAD");
 
     try {
-      // Process each commit in the stack
+      // Phase 1: Look up existing PR numbers and prepare trailer data
+      // We need PR numbers before we can add trailers to commits
+      const prNumbers: (number | undefined)[] = [];
+      
+      for (let i = 0; i < stack.entries.length; i++) {
+        const entry = stack.entries[i]!;
+        let prNumber = entry.prNumber;
+        if (!prNumber) {
+          const foundPr = await findPRByBranch(entry.branchName);
+          prNumber = foundPr ?? undefined;
+        }
+        prNumbers[i] = prNumber;
+      }
+
+      // Phase 2: Use interactive rebase to add trailers to all commits
+      // This ensures parent-child relationships are preserved
+      logger.info("Adding trailers to commits...");
+      
+      const mergeBase = await getMergeBase(head, `${remote}/${target}`);
+      
+      // Check if any commits need trailer updates
+      let needsRebase = false;
+      for (let i = 0; i < stack.entries.length; i++) {
+        const entry = stack.entries[i]!;
+        const existingTrailers = getStackerTrailers(entry.commit.body);
+        const existingPr = existingTrailers.get(TRAILER_KEYS.PR);
+        const existingBranch = existingTrailers.get(TRAILER_KEYS.BRANCH);
+        
+        // Need to update if PR number changed or branch name changed
+        if (existingPr !== String(prNumbers[i] ?? '') || existingBranch !== entry.branchName) {
+          needsRebase = true;
+          break;
+        }
+      }
+
+      if (needsRebase) {
+        // Perform interactive rebase to add trailers
+        await rebaseWithTrailers(
+          mergeBase,
+          stack.entries.map((e, i) => ({
+            sha: e.commit.sha,
+            branchName: e.branchName,
+            prNumber: prNumbers[i],
+            dependsOn: i === 0 ? stack.dependsOn?.stackName : undefined,
+          })),
+          verbose
+        );
+        
+        // Re-read commits after rebase to get new SHAs
+        const newCommits = await getCommitsInRange(mergeBase, "HEAD");
+        for (let i = 0; i < stack.entries.length; i++) {
+          if (newCommits[i]) {
+            stack.entries[i]!.commit = newCommits[i]!;
+          }
+        }
+      }
+
+      // Phase 3: Create branches at each commit and push
+      // Now that commits have trailers with correct parent relationships,
+      // we can safely create branches
+      logger.info("Creating and pushing branches...");
+      
       for (let i = 0; i < stack.entries.length; i++) {
         const entry = stack.entries[i]!;
         logger.info(
           `Processing ${i + 1}/${stack.entries.length}: ${entry.commit.shortSha} - ${entry.commit.subject}`
         );
 
-        // Create/update the branch at this commit
-        logger.debug(`Creating branch ${entry.branchName}`, verbose);
-        await createBranch(entry.branchName, entry.commit.sha);
+        // Check if remote branch already has the same content (tree SHA)
+        // Tree SHA comparison ignores commit message differences (e.g., trailer changes)
+        const localTreeSha = await getTreeSha(entry.commit.sha);
+        const remoteTreeSha = await getRemoteTreeSha(remote, entry.branchName);
+        const needsPush = remoteTreeSha !== localTreeSha;
 
-        // Push the branch
-        logger.debug(`Pushing branch ${entry.branchName}`, verbose);
-        await pushBranch(remote, entry.branchName, true);
+        if (needsPush) {
+          // Create/update the branch at this commit
+          logger.debug(`Creating branch ${entry.branchName}`, verbose);
+          await createBranch(entry.branchName, entry.commit.sha);
 
-        // Check if PR exists
-        let prNumber = entry.prNumber;
-        if (!prNumber) {
-          const foundPr = await findPRByBranch(entry.branchName);
-          prNumber = foundPr ?? undefined;
+          // Push the branch
+          logger.debug(`Pushing branch ${entry.branchName}`, verbose);
+          await pushBranch(remote, entry.branchName, true);
+        } else {
+          logger.debug(`Branch ${entry.branchName} is up-to-date, skipping push`, verbose);
         }
+      }
+
+      // Phase 4: Create/update PRs
+      logger.info("Creating/updating PRs...");
+      
+      for (let i = 0; i < stack.entries.length; i++) {
+        const entry = stack.entries[i]!;
+        let prNumber = prNumbers[i];
 
         if (prNumber) {
           // Update existing PR
@@ -101,7 +180,6 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
 
           let body: string | undefined;
           if (!keepBody) {
-            // Generate new body with cross-links
             const existingPR = await getPR(prNumber);
             body = generatePRBody(stack, i, existingPR.body);
           }
@@ -110,6 +188,7 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
             number: prNumber,
             base: entry.targetBranch,
             body,
+            title: updateTitle ? entry.commit.subject : undefined,
           });
 
           entry.prNumber = prNumber;
@@ -130,32 +209,48 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
           });
 
           entry.prNumber = prNumber;
+          prNumbers[i] = prNumber;
           logger.success(`Created PR #${prNumber}`);
-        }
-
-        // Update commit with trailers
-        // This is tricky because we need to amend the commit
-        // For now, we'll update the trailers on the branch
-        await checkout(entry.branchName);
-        const currentMessage = await getCommitMessage("HEAD");
-        const trailers = new Map<string, string>([
-          [TRAILER_KEYS.BRANCH, entry.branchName],
-          [TRAILER_KEYS.PR, String(prNumber)],
-        ]);
-
-        if (stack.dependsOn && i === 0) {
-          trailers.set(TRAILER_KEYS.DEPENDS_ON, stack.dependsOn.stackName);
-        }
-
-        const newMessage = setTrailers(currentMessage, trailers);
-        if (newMessage !== currentMessage) {
-          await amendCommitMessage(newMessage);
-          // Re-push with updated commit
-          await pushBranch(remote, entry.branchName, true);
         }
       }
 
-      // Update all PR bodies with final cross-links (now that we have all PR numbers)
+      // Phase 5: If we created new PRs, we need to update trailers with PR numbers
+      // and re-push, then update PR bodies with cross-links
+      const newPrsCreated = stack.entries.some((e, i) => !prNumbers[i] || e.prNumber !== prNumbers[i]);
+      
+      if (newPrsCreated) {
+        logger.info("Updating commits with new PR numbers...");
+        
+        await rebaseWithTrailers(
+          mergeBase,
+          stack.entries.map((e, i) => ({
+            sha: e.commit.sha,
+            branchName: e.branchName,
+            prNumber: e.prNumber,
+            dependsOn: i === 0 ? stack.dependsOn?.stackName : undefined,
+          })),
+          verbose
+        );
+        
+        // Re-read commits and update branches
+        const newCommits = await getCommitsInRange(mergeBase, "HEAD");
+        for (let i = 0; i < stack.entries.length; i++) {
+          if (newCommits[i]) {
+            stack.entries[i]!.commit = newCommits[i]!;
+            
+            // Check if push is needed (tree SHA comparison)
+            const localTreeSha = await getTreeSha(newCommits[i]!.sha);
+            const remoteTreeSha = await getRemoteTreeSha(remote, stack.entries[i]!.branchName);
+            
+            if (remoteTreeSha !== localTreeSha) {
+              await createBranch(stack.entries[i]!.branchName, newCommits[i]!.sha);
+              await pushBranch(remote, stack.entries[i]!.branchName, true);
+            }
+          }
+        }
+      }
+
+      // Phase 6: Update all PR bodies with final cross-links
       logger.info("Updating PR cross-links...");
       for (let i = 0; i < stack.entries.length; i++) {
         const entry = stack.entries[i]!;
@@ -176,11 +271,103 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
         const sha = logger.sha(entry.commit.sha);
         console.log(`  ${i + 1}. ${prRef} ${sha} - ${entry.commit.subject}`);
       }
+
+      // Cleanup: Delete local stack branches (they're only needed for pushing)
+      for (const entry of stack.entries) {
+        await deleteLocalBranch(entry.branchName);
+      }
     } finally {
       // Return to original branch
       await checkout(originalBranch);
     }
   } catch (error) {
     handleError(error, verbose);
+  }
+}
+
+/**
+ * Perform an interactive rebase to add/update trailers on commits
+ * This preserves parent-child relationships between commits
+ */
+async function rebaseWithTrailers(
+  base: string,
+  commits: Array<{
+    sha: string;
+    branchName: string;
+    prNumber: number | undefined;
+    dependsOn: string | undefined;
+  }>,
+  verbose: boolean
+): Promise<void> {
+  // Create a script that will be used as GIT_SEQUENCE_EDITOR
+  // to set up the rebase, and EDITOR to update commit messages
+  
+  // We'll use 'reword' for each commit and provide the new messages
+  const todoLines = commits.map((c) => `reword ${c.sha}`).join("\n");
+  
+  // Create temp files for the todo list and commit messages
+  const timestamp = Date.now();
+  const todoFile = `/tmp/stacker-todo-${timestamp}`;
+  const messagesDir = `/tmp/stacker-messages-${timestamp}`;
+  
+  await Bun.write(todoFile, todoLines + "\n");
+  await execStdout(`mkdir -p ${messagesDir}`);
+  
+  // Pre-compute and write all the new commit messages
+  for (let i = 0; i < commits.length; i++) {
+    const c = commits[i]!;
+    const originalMessage = await getCommitMessage(c.sha);
+    
+    const trailers = new Map<string, string>([
+      [TRAILER_KEYS.BRANCH, c.branchName],
+    ]);
+    
+    if (c.prNumber) {
+      trailers.set(TRAILER_KEYS.PR, String(c.prNumber));
+    }
+    
+    if (c.dependsOn) {
+      trailers.set(TRAILER_KEYS.DEPENDS_ON, c.dependsOn);
+    }
+    
+    const newMessage = setTrailers(originalMessage, trailers);
+    await Bun.write(`${messagesDir}/${i}`, newMessage);
+  }
+  
+  // Create the editor script that will pick the right message file
+  // based on the commit being edited (using a counter file)
+  const editorScript = `/tmp/stacker-editor-${timestamp}.sh`;
+  const counterFile = `/tmp/stacker-counter-${timestamp}`;
+  
+  await Bun.write(counterFile, "0");
+  
+  const editorContent = `#!/bin/bash
+COUNTER_FILE="${counterFile}"
+MESSAGES_DIR="${messagesDir}"
+COUNT=$(cat "$COUNTER_FILE")
+cat "$MESSAGES_DIR/$COUNT" > "$1"
+echo $((COUNT + 1)) > "$COUNTER_FILE"
+`;
+  
+  await Bun.write(editorScript, editorContent);
+  await execStdout(`chmod +x ${editorScript}`);
+  
+  try {
+    // Run the rebase with our custom editors
+    const { exec } = await import("../utils/exec");
+    await exec(`git rebase -i ${base}`, {
+      env: {
+        GIT_SEQUENCE_EDITOR: `cat "${todoFile}" >`,
+        GIT_EDITOR: editorScript,
+        EDITOR: editorScript,
+      },
+    });
+  } finally {
+    // Cleanup temp files
+    try {
+      await execStdout(`rm -rf "${todoFile}" "${messagesDir}" "${editorScript}" "${counterFile}"`);
+    } catch {
+      // Ignore cleanup errors
+    }
   }
 }

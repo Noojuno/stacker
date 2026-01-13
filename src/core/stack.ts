@@ -6,22 +6,22 @@
  */
 
 import type { Commit, Stack, StackEntry, StackDependency } from "../types";
-import { TRAILER_KEYS, getStackerTrailers } from "../utils/trailers";
+import { TRAILER_KEYS, getStackerTrailers, stripStackerTrailers } from "../utils/trailers";
 import {
   getCurrentBranch,
   getMergeBase,
   getCommitsInRange,
   parseCommit,
 } from "./git";
-import { findPRByBranch, getPR } from "./github";
+import { findPRByBranch, getPR, getCurrentRepo } from "./github";
 import { loadConfig } from "./config";
 
 /**
  * Extract the stack name from a branch name
- * e.g., "update-docs/stack/3" -> "update-docs"
+ * e.g., "stack/update-docs/3" -> "update-docs"
  */
 export function extractStackName(branchName: string): string {
-  const match = branchName.match(/^(.+?)\/stack\/\d+$/);
+  const match = branchName.match(/^stack\/(.+?)\/\d+$/);
   return match ? match[1]! : branchName;
 }
 
@@ -29,7 +29,7 @@ export function extractStackName(branchName: string): string {
  * Check if a branch name is a stack branch
  */
 export function isStackBranch(branchName: string): boolean {
-  return /\/stack\/\d+$/.test(branchName);
+  return /^stack\/.+\/\d+$/.test(branchName);
 }
 
 /**
@@ -39,7 +39,7 @@ export function generateStackBranchName(
   baseBranch: string,
   index: number
 ): string {
-  return `${baseBranch}/stack/${index}`;
+  return `stack/${baseBranch}/${index}`;
 }
 
 /**
@@ -119,6 +119,9 @@ export async function buildStack(options: {
   // Detect dependency on another stack
   const dependsOn = await detectDependency(currentBranch, `${remote}/${target}`);
   
+  // Get repo for constructing PR URLs
+  const repo = await getCurrentRepo();
+  
   // Build stack entries
   const entries: StackEntry[] = [];
   
@@ -155,9 +158,13 @@ export async function buildStack(options: {
       targetBranch = entries[i - 1]!.branchName;
     }
     
+    // Construct PR URL if we have a PR number
+    const prUrl = prNumber ? `https://github.com/${repo}/pull/${prNumber}` : undefined;
+    
     entries.push({
       commit,
       prNumber,
+      prUrl,
       branchName,
       targetBranch,
     });
@@ -216,10 +223,40 @@ export function generatePRBody(
   }
   
   lines.push("");
+  
+  // Add Prev/Next navigation links
+  const prevEntry = currentIndex > 0 ? stack.entries[currentIndex - 1] : null;
+  const nextEntry = currentIndex < stack.entries.length - 1 ? stack.entries[currentIndex + 1] : null;
+  
+  const navParts: string[] = [];
+  if (prevEntry) {
+    const prevRef = prevEntry.prNumber ? `#${prevEntry.prNumber}` : prevEntry.branchName;
+    navParts.push(`⬅️ Prev: ${prevRef}`);
+  }
+  if (nextEntry) {
+    const nextRef = nextEntry.prNumber ? `#${nextEntry.prNumber}` : nextEntry.branchName;
+    navParts.push(`Next: ${nextRef} ➡️`);
+  }
+  
+  if (navParts.length > 0) {
+    lines.push(navParts.join(" | "));
+    lines.push("");
+  }
+  
   lines.push("---");
   lines.push("<!-- stacker:end -->");
   
-  // Add original body if provided
+  // Add commit message body as PR description
+  const currentEntry = stack.entries[currentIndex];
+  if (currentEntry) {
+    const commitBody = stripStackerTrailers(currentEntry.commit.body).trim();
+    if (commitBody) {
+      lines.push("");
+      lines.push(commitBody);
+    }
+  }
+  
+  // Add original body if provided (excluding any commit body that might have been there)
   if (originalBody) {
     // Remove existing stacker section
     const cleanedBody = removeStackerSection(originalBody);

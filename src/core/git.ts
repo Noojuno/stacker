@@ -387,3 +387,32 @@ export async function isAncestor(
   );
   return result.exitCode === 0;
 }
+
+/**
+ * Get the tree SHA for a commit (the actual content, ignoring commit message)
+ */
+export async function getTreeSha(ref: string): Promise<string> {
+  try {
+    return await execStdout(`git log -1 --format="%T" ${ref}`);
+  } catch (error) {
+    throw new CommitNotFoundError(ref, error instanceof Error ? error : undefined);
+  }
+}
+
+/**
+ * Get the tree SHA of a remote branch
+ * Returns null if the branch doesn't exist on the remote
+ */
+export async function getRemoteTreeSha(
+  remote: string,
+  branchName: string
+): Promise<string | null> {
+  try {
+    // Fetch the remote ref to ensure we have it locally
+    await exec(`git fetch ${remote} ${branchName}`, { ignoreExitCode: true });
+    // Get the tree SHA
+    return await execStdout(`git log -1 --format="%T" ${remote}/${branchName}`);
+  } catch {
+    return null;
+  }
+}

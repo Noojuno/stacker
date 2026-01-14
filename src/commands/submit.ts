@@ -23,8 +23,7 @@ import {
   getMergeBase,
   parseCommit,
   deleteLocalBranch,
-  getTreeSha,
-  getRemoteTreeSha,
+  getRemoteBranchSha,
 } from "../core/git";
 import { setTrailers, TRAILER_KEYS, getStackerTrailers } from "../utils/trailers";
 import { handleError } from "../utils/error-handler";
@@ -43,9 +42,10 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
     reviewer?: string;
     keepBody: boolean;
     updateTitle: boolean;
+    repair: boolean;
   };
 
-  const { remote, base, head, target, verbose, draft, reviewer, keepBody, updateTitle } = opts;
+  const { remote, base, head, target, verbose, draft, reviewer, keepBody, updateTitle, repair } = opts;
 
   try {
     // Validate prerequisites
@@ -91,6 +91,21 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
           const foundPr = await findPRByBranch(entry.branchName);
           prNumber = foundPr ?? undefined;
         }
+        
+        // If repair mode is enabled, check if the PR is closed and skip it
+        if (repair && prNumber) {
+          try {
+            const pr = await getPR(prNumber);
+            if (pr.state === "CLOSED") {
+              logger.info(`PR #${prNumber} is closed, will create new PR (--repair)`);
+              prNumber = undefined;
+            }
+          } catch {
+            // PR not found or error, treat as no PR
+            prNumber = undefined;
+          }
+        }
+        
         prNumbers[i] = prNumber;
       }
 
@@ -148,11 +163,10 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
           `Processing ${i + 1}/${stack.entries.length}: ${entry.commit.shortSha} - ${entry.commit.subject}`
         );
 
-        // Check if remote branch already has the same content (tree SHA)
-        // Tree SHA comparison ignores commit message differences (e.g., trailer changes)
-        const localTreeSha = await getTreeSha(entry.commit.sha);
-        const remoteTreeSha = await getRemoteTreeSha(remote, entry.branchName);
-        const needsPush = remoteTreeSha !== localTreeSha;
+        // Check if remote branch already has the same commit
+        // Compare full commit SHAs to ensure parent relationships are correct for stacked PRs
+        const remoteCommitSha = await getRemoteBranchSha(remote, entry.branchName);
+        const needsPush = remoteCommitSha !== entry.commit.sha;
 
         if (needsPush) {
           // Create/update the branch at this commit
@@ -169,6 +183,8 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
 
       // Phase 4: Create/update PRs
       logger.info("Creating/updating PRs...");
+      
+      let newPrsCreated = false;
       
       for (let i = 0; i < stack.entries.length; i++) {
         const entry = stack.entries[i]!;
@@ -210,13 +226,13 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
 
           entry.prNumber = prNumber;
           prNumbers[i] = prNumber;
+          newPrsCreated = true;
           logger.success(`Created PR #${prNumber}`);
         }
       }
 
       // Phase 5: If we created new PRs, we need to update trailers with PR numbers
       // and re-push, then update PR bodies with cross-links
-      const newPrsCreated = stack.entries.some((e, i) => !prNumbers[i] || e.prNumber !== prNumbers[i]);
       
       if (newPrsCreated) {
         logger.info("Updating commits with new PR numbers...");
@@ -238,11 +254,10 @@ export async function submitCommand(argv: ArgumentsCamelCase): Promise<void> {
           if (newCommits[i]) {
             stack.entries[i]!.commit = newCommits[i]!;
             
-            // Check if push is needed (tree SHA comparison)
-            const localTreeSha = await getTreeSha(newCommits[i]!.sha);
-            const remoteTreeSha = await getRemoteTreeSha(remote, stack.entries[i]!.branchName);
+            // Check if push is needed (compare commit SHAs for correct parent chain)
+            const remoteCommitSha = await getRemoteBranchSha(remote, stack.entries[i]!.branchName);
             
-            if (remoteTreeSha !== localTreeSha) {
+            if (remoteCommitSha !== newCommits[i]!.sha) {
               await createBranch(stack.entries[i]!.branchName, newCommits[i]!.sha);
               await pushBranch(remote, stack.entries[i]!.branchName, true);
             }

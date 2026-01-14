@@ -416,3 +416,21 @@ export async function getRemoteTreeSha(
     return null;
   }
 }
+
+/**
+ * Get the commit SHA of a remote branch
+ * Returns null if the branch doesn't exist on the remote
+ */
+export async function getRemoteBranchSha(
+  remote: string,
+  branchName: string
+): Promise<string | null> {
+  try {
+    // Fetch the remote ref to ensure we have it locally
+    await exec(`git fetch ${remote} ${branchName}`, { ignoreExitCode: true });
+    // Get the commit SHA
+    return await execStdout(`git rev-parse ${remote}/${branchName}`);
+  } catch {
+    return null;
+  }
+}

@@ -73,6 +73,11 @@ const cli = yargs(hideBin(process.argv))
         default: false,
         describe: "Update PR titles from commit subjects",
       },
+      repair: {
+        type: "boolean",
+        default: false,
+        describe: "Create new PRs for any that were closed",
+      },
     },
     submitCommand
   )

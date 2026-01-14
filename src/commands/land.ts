@@ -15,12 +15,11 @@ import {
   checkout,
   fetch,
   rebaseOnto,
-  pushBranch,
   getCommitMessage,
-  amendCommitMessage,
   getCurrentBranch,
 } from "../core/git";
 import { stripStackerTrailers } from "../utils/trailers";
+import { exec } from "../utils/exec";
 import { handleError } from "../utils/error-handler";
 import {
   NoPRForCommitError,
@@ -45,7 +44,16 @@ export async function landCommand(argv: ArgumentsCamelCase): Promise<void> {
     force?: boolean;
   };
 
-  const { remote, base, head, target, verbose = false, all, dryRun, force } = opts;
+  const {
+    remote,
+    base,
+    head,
+    target,
+    verbose = false,
+    all,
+    dryRun,
+    force,
+  } = opts;
 
   try {
     // Validate prerequisites
@@ -78,14 +86,24 @@ export async function landCommand(argv: ArgumentsCamelCase): Promise<void> {
 
     if (dryRun) {
       logger.header("Dry Run - Would land:");
-      console.log(`  PR #${bottomEntry.prNumber}: ${bottomEntry.commit.subject}`);
+      console.log(
+        `  PR #${bottomEntry.prNumber}: ${bottomEntry.commit.subject}`
+      );
       console.log(`  Mergeable: ${status.mergeable}`);
       console.log(`  Review: ${status.reviewDecision ?? "none"}`);
       console.log(`  State: ${status.mergeStateStatus}`);
-      
+
       const ciStatus = await areCIChecksPassing(bottomEntry.prNumber);
-      console.log(`  CI: ${ciStatus.passing ? "passing" : ciStatus.pending ? "pending" : "failing"}`);
-      
+      console.log(
+        `  CI: ${
+          ciStatus.passing
+            ? "passing"
+            : ciStatus.pending
+            ? "pending"
+            : "failing"
+        }`
+      );
+
       if (stack.entries.length > 1) {
         console.log(`\n  Remaining: ${stack.entries.length - 1} PRs to rebase`);
       }
@@ -112,7 +130,7 @@ export async function landCommand(argv: ArgumentsCamelCase): Promise<void> {
 
     // Check CI status
     const ciStatus = await areCIChecksPassing(bottomEntry.prNumber);
-    
+
     if (ciStatus.failing) {
       const failedChecks = ciStatus.checks
         .filter((c) => c.conclusion === "FAILURE" || c.conclusion === "ERROR")
@@ -138,60 +156,92 @@ export async function landCommand(argv: ArgumentsCamelCase): Promise<void> {
       }
     }
 
-    // === STRIP METADATA ===
-    logger.info("Cleaning commit metadata...");
     const originalBranch = await getCurrentBranch();
-    
-    await checkout(bottomEntry.branchName);
-    const currentMessage = await getCommitMessage("HEAD");
-    const cleanedMessage = stripStackerTrailers(currentMessage);
-    
-    if (cleanedMessage !== currentMessage) {
-      await amendCommitMessage(cleanedMessage);
-      await pushBranch(remote, bottomEntry.branchName, true);
-    }
-
-    // === MERGE ===
-    logger.info(`Landing PR #${bottomEntry.prNumber}: ${bottomEntry.commit.subject}`);
-    await mergePR({
-      number: bottomEntry.prNumber,
-      method: "rebase",
-      deleteBranch: true,
-    });
-
-    logger.success(`Merged PR #${bottomEntry.prNumber}`);
-
-    // === REBASE REMAINING ===
     const landTarget = stack.dependsOn?.topBranch ?? target;
-    await fetch(remote, landTarget);
 
+    // === UPDATE NEXT PR BASE BEFORE MERGE ===
+    // Must happen before merge to prevent GitHub from closing the PR
+    // when its base branch (the first PR's branch) is deleted
     if (stack.entries.length > 1) {
-      logger.info(`Rebasing ${stack.entries.length - 1} remaining PRs...`);
-
-      // Checkout the original branch
-      await checkout(originalBranch);
-
-      // Rebase onto updated target
-      try {
-        await rebaseOnto(`${remote}/${landTarget}`);
-      } catch (error) {
-        throw new RebaseConflictError(error instanceof Error ? error : undefined);
-      }
-
-      // Update base branch for next PR
       const nextEntry = stack.entries[1]!;
       if (nextEntry.prNumber) {
+        logger.info(
+          `Updating PR #${nextEntry.prNumber} base to ${landTarget}...`
+        );
         await updatePR({
           number: nextEntry.prNumber,
           base: landTarget,
         });
       }
+    }
 
-      // Force push all remaining stack branches
+    // === MERGE ===
+    // Use squash merge with clean commit message (metadata stripped)
+    // This keeps CI valid since we don't modify the branch before merging
+    logger.info(
+      `Landing PR #${bottomEntry.prNumber}: ${bottomEntry.commit.subject}`
+    );
+
+    const currentMessage = await getCommitMessage(bottomEntry.commit.sha);
+    const cleanedMessage = stripStackerTrailers(currentMessage);
+    const lines = cleanedMessage.split("\n");
+    const title = `${lines[0]} (#${bottomEntry.prNumber})`;
+    const body = lines.slice(1).join("\n").trim() || " ";
+
+    await mergePR({
+      number: bottomEntry.prNumber,
+      method: "squash",
+      deleteBranch: true,
+      title,
+      body,
+    });
+
+    logger.success(`Merged PR #${bottomEntry.prNumber}`);
+
+    // === REBASE REMAINING ===
+    await fetch(remote, landTarget);
+
+    if (stack.entries.length > 1) {
+      logger.info(`Rebasing ${stack.entries.length - 1} remaining PRs...`);
+
+      // Rebase each remaining PR onto the updated target
+      // This follows the stack-pr approach: checkout remote branch, rebase, force push
       for (let i = 1; i < stack.entries.length; i++) {
         const entry = stack.entries[i]!;
-        await pushBranch(remote, entry.branchName, true);
+        logger.debug(`Rebasing ${entry.branchName}...`, verbose);
+
+        // Checkout the remote branch locally
+        await fetch(remote, entry.branchName);
+        await exec(
+          `git checkout ${remote}/${entry.branchName} -B ${entry.branchName}`
+        );
+
+        // Rebase onto updated target
+        try {
+          await exec(
+            `git rebase ${remote}/${landTarget} ${entry.branchName} --committer-date-is-author-date`
+          );
+        } catch (error) {
+          throw new RebaseConflictError(
+            error instanceof Error ? error : undefined
+          );
+        }
+
+        // Force push the rebased branch
+        await exec(
+          `git push ${remote} -f ${entry.branchName}:${entry.branchName}`
+        );
         logger.debug(`Pushed ${entry.branchName}`, verbose);
+      }
+
+      // Return to original branch and rebase it too
+      await checkout(originalBranch);
+      try {
+        await rebaseOnto(`${remote}/${landTarget}`);
+      } catch (error) {
+        throw new RebaseConflictError(
+          error instanceof Error ? error : undefined
+        );
       }
     }
 

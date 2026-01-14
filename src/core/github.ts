@@ -241,8 +241,10 @@ export async function mergePR(options: {
   number: number;
   method?: "squash" | "merge" | "rebase";
   deleteBranch?: boolean;
+  title?: string;
+  body?: string;
 }): Promise<void> {
-  const { number, method = "rebase", deleteBranch = true } = options;
+  const { number, method = "rebase", deleteBranch = true, title, body } = options;
 
   let cmd = `gh pr merge ${number} --${method}`;
   
@@ -250,8 +252,28 @@ export async function mergePR(options: {
     cmd += " --delete-branch";
   }
 
+  // For squash merges, we can pass a custom title and body
+  // This allows us to strip metadata from the final commit without
+  // modifying the branch (which would invalidate CI checks)
+  if (title) {
+    cmd += ` -t "${escapeForShell(title)}"`;
+  }
+
   try {
-    await exec(cmd);
+    if (body !== undefined) {
+      // Write body to temp file to handle complex content
+      const bodyFile = `/tmp/stacker-merge-body-${Date.now()}`;
+      await Bun.write(bodyFile, body);
+      cmd += ` -F "${bodyFile}"`;
+      
+      try {
+        await exec(cmd);
+      } finally {
+        await exec(`rm -f "${bodyFile}"`, { ignoreExitCode: true });
+      }
+    } else {
+      await exec(cmd);
+    }
   } catch (error) {
     throw new PRMergeError(number, error instanceof Error ? error : undefined);
   }
